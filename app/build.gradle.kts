@@ -11,8 +11,8 @@ android {
         applicationId = "com.digitalassistant.app"
         minSdk = 23
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     compileOptions {
@@ -27,4 +27,10 @@ android {
 
 dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
+
+    // HTTPS-запросы к OpenAI
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Проверка подписи OAuth-токенов
+    implementation("com.nimbusds:nimbus-jose-jwt:9.40")
 }
