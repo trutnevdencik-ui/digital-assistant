@@ -1,8 +1,10 @@
+
 package com.digitalassistant.app
 
 import android.app.Activity
 import android.util.Base64
 import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -25,7 +27,7 @@ class ChatGPTBridge(
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
     private val prefs = activity.getSharedPreferences(
@@ -69,6 +71,7 @@ class ChatGPTBridge(
     @JavascriptInterface
     fun disconnectChatGPT() {
         auth.disconnect()
+
         synchronized(history) {
             while (history.length() > 0) {
                 history.remove(0)
@@ -76,12 +79,16 @@ class ChatGPTBridge(
         }
 
         activity.runOnUiThread {
-            activityAction("onChatGPTDisconnected", "true")
+            activityAction("onChatGPTDisconnected")
         }
     }
 
     @JavascriptInterface
-    fun sendMessage(requestId: String, message: String, persona: String) {
+    fun sendMessage(
+        requestId: String,
+        message: String,
+        persona: String
+    ) {
         if (message.isBlank()) {
             sendError(requestId, "Введите сообщение")
             return
@@ -94,18 +101,143 @@ class ChatGPTBridge(
 
         executor.execute {
             try {
-                val credentials = readCredentials()
-                var accessToken = credentials.getString("access_token")
+                var credentials = readCredentials()
 
-                val expiresAt = credentials.optLong("expires_at", 0)
-
-                if (System.currentTimeMillis() >= expiresAt - 60000) {
+                if (
+                    System.currentTimeMillis() >=
+                    credentials.optLong("expires_at", 0) - 60000
+                ) {
                     credentials = refreshToken(credentials)
-                    accessToken = credentials.getString("access_token")
                     saveCredentials(credentials)
                 }
 
-                val messages = synchronized(history) {
+                val accessToken =
+                    credentials.getString("access_token")
+
+                val model = getAvailableModel(accessToken)
+
+                val input = JSONArray()
+
+                synchronized(history) {
+                    for (i in 0 until history.length()) {
+                        input.put(history.getJSONObject(i))
+                    }
+                }
+
+                input.put(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", message)
+                    }
+                )
+
+                val instructions =
+                    "Ты — $persona, цифровой голосовой помощник. " +
+                    "Отвечай по-русски, естественно и дружелюбно. " +
+                    "Обычно отвечай кратко и по существу. " +
+                    "Не используй Markdown, эмодзи и ссылки. " +
+                    "Не выдумывай факты."
+
+                val body = JSONObject().apply {
+                    put("model", model)
+                    put("instructions", instructions)
+                    put("input", input)
+                    put("store", false)
+                    put("stream", true)
+                }
+
+                val request = Request.Builder()
+                    .url("https://api.openai.com/v1/responses")
+                    .header(
+                        "Authorization",
+                        "Bearer $accessToken"
+                    )
+                    .header("Content-Type", "application/json")
+                    .post(body.toString().toRequestBody(mediaType))
+                    .build()
+
+                val answer = StringBuilder()
+                var completed = false
+
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        val errorText =
+                            response.body?.string().orEmpty()
+
+                        throw Exception(
+                            extractError(errorText, response.code)
+                        )
+                    }
+
+                    val source = response.body?.source()
+                        ?: throw Exception("Пустой ответ сервера")
+
+                    while (true) {
+                        val line = source.readUtf8Line() ?: break
+
+                        if (!line.startsWith("data:")) continue
+
+                        val payload = line
+                            .removePrefix("data:")
+                            .trim()
+
+                        if (payload.isBlank() || payload == "[DONE]") {
+                            continue
+                        }
+
+                        val event = JSONObject(payload)
+                        when (event.optString("type")) {
+                            "response.output_text.delta" -> {
+                                answer.append(
+                                    event.optString("delta")
+                                )
+                            }
+
+                            "response.failed" -> {
+                                val error = event
+                                    .optJSONObject("response")
+                                    ?.optJSONObject("error")
+
+                                throw Exception(
+                                    error?.optString("message")
+                                        ?: "Ошибка генерации ChatGPT"
+                                )
+                            }
+
+                            "response.incomplete" -> {
+                                throw Exception(
+                                    "Ответ ChatGPT не был завершён"
+                                )
+                            }
+
+                            "error" -> {
+                                throw Exception(
+                                    event.optJSONObject("error")
+                                        ?.optString("message")
+                                        ?: "Ошибка потока ответа"
+                                )
+                            }
+
+                            "response.completed" -> {
+                                completed = true
+                            }
+                        }
+                    }
+                }
+
+                if (!completed) {
+                    throw Exception(
+                        "Соединение прервано до завершения ответа"
+                    )
+                }
+
+                val finalAnswer = answer.toString().trim()
+
+                if (finalAnswer.isBlank()) {
+                    throw Exception("ChatGPT вернул пустой ответ")
+                }
+
+                synchronized(history) {
                     history.put(
                         JSONObject().apply {
                             put("role", "user")
@@ -113,73 +245,10 @@ class ChatGPTBridge(
                         }
                     )
 
-                    while (history.length() > 12) {
-                        history.remove(0)
-                    }
-
-                    JSONArray(history.toString())
-                }
-
-                val instructions =
-                    "Ты — $persona, цифровой голосовой помощник. " +
-                    "Отвечай по-русски, естественно и дружелюбно. " +
-                    "Обычно отвечай кратко, по существу, без Markdown, " +
-                    "эмодзи и ссылок. Не выдумывай факты."
-
-                val input = JSONArray()
-
-                for (i in 0 until messages.length()) {
-                    val item = messages.getJSONObject(i)
-
-                    input.put(
-                        JSONObject().apply {
-                            put("role", item.getString("role"))
-                            put("content", item.getString("content"))
-                        }
-                    )
-                }
-
-                val body = JSONObject().apply {
-                    put("model", "gpt-5")
-                    put("instructions", instructions)
-                    put("input", input)
-                    put("store", false)
-                    put("stream", false)
-                }
-
-                val request = Request.Builder()
-                    .url("https://api.openai.com/v1/responses")
-                    .header("Authorization", "Bearer $accessToken")
-                    .header("Content-Type", "application/json")
-                    .post(body.toString().toRequestBody(mediaType))
-                    .build()
-
-                val answer: String
-
-                client.newCall(request).execute().use { response ->
-                    val result = response.body?.string().orEmpty()
-
-                    if (!response.isSuccessful) {
-                        val error = JSONObject(result)
-                            .optJSONObject("error")
-                            ?.optString("message")
-                            ?: "Ошибка ChatGPT: ${response.code}"
-
-                        throw Exception(error)
-                    }
-
-                    answer = extractAnswer(JSONObject(result))
-                }
-
-                if (answer.isBlank()) {
-                    throw Exception("ChatGPT вернул пустой ответ")
-                }
-
-                synchronized(history) {
                     history.put(
                         JSONObject().apply {
                             put("role", "assistant")
-                            put("content", answer)
+                            put("content", finalAnswer)
                         }
                     )
 
@@ -192,7 +261,7 @@ class ChatGPTBridge(
                     activityAction(
                         "onChatGPTReply",
                         JSONObject.quote(requestId),
-                        JSONObject.quote(answer)
+                        JSONObject.quote(finalAnswer)
                     )
                 }
 
@@ -205,35 +274,49 @@ class ChatGPTBridge(
         }
     }
 
-    private fun extractAnswer(data: JSONObject): String {
-        val direct = data.optString("output_text")
-        if (direct.isNotBlank()) return direct.trim()
+    private fun getAvailableModel(token: String): String {
+        val request = Request.Builder()
+            .url("https://api.openai.com/v1/models")
+            .header("Authorization", "Bearer $token")
+            .get()
+            .build()
 
-        val output = data.optJSONArray("output")
-            ?: throw Exception("В ответе отсутствует текст")
+        client.newCall(request).execute().use { response ->
+            val text = response.body?.string().orEmpty()
 
-        val result = StringBuilder()
+            if (!response.isSuccessful) {
+                throw Exception(
+                    extractError(text, response.code)
+                )
+            }
 
-        for (i in 0 until output.length()) {
-            val item = output.optJSONObject(i) ?: continue
-            val content = item.optJSONArray("content") ?: continue
+            val data = JSONObject(text)
+            val models = data.optJSONArray("models")
+                ?: throw Exception("Список моделей недоступен")
 
-            for (j in 0 until content.length()) {
-                val part = content.optJSONObject(j) ?: continue
+            for (i in 0 until models.length()) {
+                val item = models.optJSONObject(i) ?: continue
 
-                if (part.optString("type") == "output_text") {
-                    result.append(part.optString("text"))
+                if (item.optString("visibility") == "list") {
+                    val slug = item.optString("slug")
+
+                    if (slug.isNotBlank()) return slug
                 }
             }
-        }
 
-        return result.toString().trim()
+            throw Exception(
+                "Для этого аккаунта не найдено доступных моделей"
+            )
+        }
     }
 
     private fun refreshToken(old: JSONObject): JSONObject {
         val refresh = old.optString("refresh_token")
+
         if (refresh.isBlank()) {
-            throw Exception("Нужно заново подключить ChatGPT")
+            throw Exception(
+                "Сессия истекла. Подключите ChatGPT заново."
+            )
         }
 
         val body = FormBody.Builder()
@@ -249,20 +332,27 @@ class ChatGPTBridge(
             .build()
 
         client.newCall(request).execute().use { response ->
-            val result = response.body?.string().orEmpty()
+            val text = response.body?.string().orEmpty()
 
             if (!response.isSuccessful) {
                 throw Exception(
-                    "Сессия ChatGPT истекла. Подключите аккаунт заново."
+                    "Не удалось обновить сессию. " +
+                    "Подключите ChatGPT заново."
                 )
             }
 
-            val fresh = JSONObject(result)
+            val fresh = JSONObject(text)
 
-            old.put("access_token", fresh.getString("access_token"))
+            old.put(
+                "access_token",
+                fresh.getString("access_token")
+            )
 
             if (fresh.has("refresh_token")) {
-                old.put("refresh_token", fresh.getString("refresh_token"))
+                old.put(
+                    "refresh_token",
+                    fresh.getString("refresh_token")
+                )
             }
 
             old.put(
@@ -279,7 +369,10 @@ class ChatGPTBridge(
         val encrypted = prefs.getString("credentials", null)
             ?: throw Exception("ChatGPT не подключён")
 
-        val combined = Base64.decode(encrypted, Base64.NO_WRAP)
+        val combined = Base64.decode(
+            encrypted,
+            Base64.NO_WRAP
+        )
 
         if (combined.size <= 12) {
             throw Exception("Повреждены данные авторизации")
@@ -295,7 +388,7 @@ class ChatGPTBridge(
             "digital_face_chatgpt_key",
             null
         ) as? SecretKey
-            ?: throw Exception("Не найден ключ защищённого хранилища")
+            ?: throw Exception("Ключ защищённого хранилища не найден")
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
 
@@ -306,7 +399,10 @@ class ChatGPTBridge(
         )
 
         return JSONObject(
-            String(cipher.doFinal(data), Charsets.UTF_8)
+            String(
+                cipher.doFinal(data),
+                Charsets.UTF_8
+            )
         )
     }
 
@@ -318,7 +414,7 @@ class ChatGPTBridge(
             "digital_face_chatgpt_key",
             null
         ) as? SecretKey
-            ?: throw Exception("Не найден ключ защищённого хранилища")
+            ?: throw Exception("Ключ защищённого хранилища не найден")
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key)
@@ -332,9 +428,29 @@ class ChatGPTBridge(
         prefs.edit()
             .putString(
                 "credentials",
-                Base64.encodeToString(combined, Base64.NO_WRAP)
+                Base64.encodeToString(
+                    combined,
+                    Base64.NO_WRAP
+                )
             )
             .apply()
+    }
+
+    private fun extractError(
+        text: String,
+        status: Int
+    ): String {
+        return try {
+            val json = JSONObject(text)
+            json.optJSONObject("error")
+                ?.optString("message")
+                ?.takeIf { it.isNotBlank() }
+                ?: json.optString("detail")
+                    .takeIf { it.isNotBlank() }
+                ?: "Ошибка сервера: $status"
+        } catch (_: Exception) {
+            "Ошибка сервера: $status"
+        }
     }
 
     private fun sendError(id: String, message: String) {
@@ -354,15 +470,12 @@ class ChatGPTBridge(
         val args = arguments.joinToString(",")
         val script = "window.$function($args);"
 
-        // MainActivity подключит WebView и вызов этого метода.
-        val webViewField = activity.javaClass
+        val field = activity.javaClass
             .getDeclaredField("webView")
 
-        webViewField.isAccessible = true
+        field.isAccessible = true
 
-        val webView = webViewField.get(activity)
-            as? android.webkit.WebView
-
+        val webView = field.get(activity) as? WebView
         webView?.evaluateJavascript(script, null)
     }
 
