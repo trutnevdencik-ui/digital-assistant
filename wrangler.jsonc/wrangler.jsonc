@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "digital-assistant-ai",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-06",
+  "workers_dev": true,
+  "ai": {
+    "binding": "AI"
+  },
+  "assets": {
+    "directory": "./app/src/main/assets",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  }
+}
